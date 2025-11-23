@@ -112,21 +112,19 @@ type Message struct {
 	BoardID    int               `json:"boardId,omitempty"`
 	Position   int               `json:"position,omitempty"`
 	Symbol     string            `json:"symbol,omitempty"`
-	Name       string            `json:"name,omitempty"`       // <-- Added Name
-	Spectators []string          `json:"spectators,omitempty"` // <-- For broadcasting lists
-	Board      map[string]string `json:"board,omitempty"`      // <-- Fixed type for HGetAll
+	Name       string            `json:"name,omitempty"`
+	Spectators []string          `json:"spectators,omitempty"`
+	Board      map[string]string `json:"board,omitempty"`
 }
 
 type client struct {
-	conn   *websocket.Conn
-	send   chan []byte
-	mu     sync.Mutex
-	closed bool
-	pubsub *redis.PubSub
-	done   chan struct{}
-	// State to track for cleanup on disconnect
+	conn    *websocket.Conn
+	send    chan []byte
+	mu      sync.Mutex
+	closed  bool
+	pubsub  *redis.PubSub
+	done    chan struct{}
 	name    string
-	role    string
 	boardID int
 }
 
@@ -162,20 +160,16 @@ func (c *client) close() {
 	}
 	c.closed = true
 
-	// --- Cleanup Logic ---
+	// Cleanup: Remove user from the queue if they leave
 	if c.name != "" {
-		log.Printf("Cleaning up user: %s (%s)", c.name, c.role)
-		if c.role == "spectator" {
-			key := fmt.Sprintf("board:%d:spectators", c.boardID)
-			rdb.SRem(ctx, key, c.name)
-			broadcastSpectators(c.boardID)
-		} else if c.role == "player" {
-			// Optional: clear the player seat if they disconnect?
-			// For now, we keep the game state, but maybe announce they left.
-			// To reset fully, we'd set playerX="" in Redis.
-		}
+		// remove from spectator list (Queue)
+		key := fmt.Sprintf("board:%d:queue", c.boardID)
+		rdb.LRem(ctx, key, 0, c.name) // 0 removes all occurrences
+
+		// Note: If the active player leaves, we strictly don't handle that
+		// edge case here (game pauses), but the rotation handles the rest.
+		broadcastSpectators(c.boardID)
 	}
-	// ---------------------
 
 	close(c.done)
 	if c.pubsub != nil {
@@ -225,7 +219,6 @@ func main() {
 				handleClientMessage(c, sha, msg)
 			}
 		}()
-
 		<-c.done
 	})
 
@@ -260,104 +253,119 @@ func subscribeToBoard(c *client, boardID int) {
 
 // Helper to fetch all spectators and broadcast via PubSub
 func broadcastSpectators(boardID int) {
-	key := fmt.Sprintf("board:%d:spectators", boardID)
-	specs, _ := rdb.SMembers(ctx, key).Result()
+	// CHANGED: Use LRANGE instead of SMEMBERS to get ordered list
+	key := fmt.Sprintf("board:%d:queue", boardID)
+	specs, _ := rdb.LRange(ctx, key, 0, -1).Result()
 
 	msg := Message{
 		Type:       "spectators_update",
 		Spectators: specs,
 	}
-
 	b, _ := json.Marshal(msg)
 	rdb.Publish(ctx, fmt.Sprintf("board:%d", boardID), b)
 }
 
 func resetBoardState(boardID int) {
 	boardKey := fmt.Sprintf("board:%d", boardID)
+	// We do NOT clear player names here, only the grid
 	rdb.HSet(ctx, boardKey,
 		"cells", "_,_,_,_,_,_,_,_,_",
 		"turn", "X",
 		"winner", "",
-		"playerX", "",
-		"playerO", "",
-		"playerXName", "Waiting...",
-		"playerOName", "Waiting...",
 	)
 }
 
+func rotatePlayers(boardID int) {
+	boardKey := fmt.Sprintf("board:%d", boardID)
+	queueKey := fmt.Sprintf("board:%d:queue", boardID)
+
+	// 1. Get current players
+	pX, _ := rdb.HGet(ctx, boardKey, "playerXName").Result()
+	pO, _ := rdb.HGet(ctx, boardKey, "playerOName").Result()
+
+	// 2. Push current players to back of queue (if they exist)
+	if pX != "" && pX != "Waiting..." {
+		rdb.RPush(ctx, queueKey, pX)
+	}
+	if pO != "" && pO != "Waiting..." {
+		rdb.RPush(ctx, queueKey, pO)
+	}
+
+	// 3. Pop new players from front of queue
+	// We try to get 2 people.
+	newX, err1 := rdb.LPop(ctx, queueKey).Result()
+	if err1 == redis.Nil {
+		newX = "Waiting..."
+	} // Queue empty
+
+	newO, err2 := rdb.LPop(ctx, queueKey).Result()
+	if err2 == redis.Nil {
+		newO = "Waiting..."
+	}
+
+	// 4. Update Board State
+	rdb.HSet(ctx, boardKey, "playerXName", newX, "playerOName", newO)
+
+	// Reset the grid for the new game
+	resetBoardState(boardID)
+
+	// 5. Notify Everyone
+	// Broadcast new board state (roles)
+	data, _ := rdb.HGetAll(ctx, boardKey).Result()
+	bBoard, _ := json.Marshal(map[string]interface{}{"type": "board_state", "board": data})
+	rdb.Publish(ctx, fmt.Sprintf("board:%d", boardID), bBoard)
+
+	// Broadcast new spectator list (since we popped and pushed)
+	broadcastSpectators(boardID)
+}
 func handleClientMessage(c *client, sha string, msg Message) {
 	switch msg.Type {
 	case "join":
 		boardID := 0
-		symbol := "X"
-		boardKey := fmt.Sprintf("board:%d", boardID)
-
-		playerX, _ := rdb.HGet(ctx, boardKey, "playerX").Result()
-		playerO, _ := rdb.HGet(ctx, boardKey, "playerO").Result()
-
-		if playerX != "" && playerO != "" {
-			sendJSON(c, map[string]string{"type": "error", "error": "Board is full"})
-			return
-		}
-
-		if playerX != "" {
-			symbol = "O"
-		}
-
-		// Store Client Info
-		c.role = "player"
 		c.boardID = boardID
 		c.name = msg.Name
+		boardKey := fmt.Sprintf("board:%d", boardID)
 
-		// Update Redis
-		playerKey := "player" + symbol              // e.g. playerX
-		playerNameKey := "player" + symbol + "Name" // e.g. playerXName
+		// Check if seats are empty
+		currX, _ := rdb.HGet(ctx, boardKey, "playerXName").Result()
+		currO, _ := rdb.HGet(ctx, boardKey, "playerOName").Result()
 
-		rdb.HSet(ctx, boardKey, playerKey, "active", playerNameKey, msg.Name)
+		assigned := false
 
+		// Logic: If seat empty, take it. Else, go to queue.
+		if currX == "" || currX == "Waiting..." {
+			rdb.HSet(ctx, boardKey, "playerXName", msg.Name)
+			assigned = true
+		} else if currO == "" || currO == "Waiting..." {
+			rdb.HSet(ctx, boardKey, "playerOName", msg.Name)
+			assigned = true
+		}
+
+		if !assigned {
+			// Add to Queue (Spectator List)
+			rdb.RPush(ctx, fmt.Sprintf("board:%d:queue", boardID), msg.Name)
+		}
+
+		// Reply to user
 		sendJSON(c, map[string]interface{}{
 			"type":    "joined",
-			"role":    "player",
 			"boardId": boardID,
-			"symbol":  symbol,
 		})
 
 		subscribeToBoard(c, boardID)
 
-		// Force a board update so everyone sees the new player name
+		// Broadcast updates
 		data, _ := rdb.HGetAll(ctx, boardKey).Result()
 		b, _ := json.Marshal(map[string]interface{}{"type": "board_state", "board": data})
 		rdb.Publish(ctx, fmt.Sprintf("board:%d", boardID), b)
-
-		// Also send current spectators to the new player
 		broadcastSpectators(boardID)
-
-	case "join_spectator":
-		boardID := 0
-		c.role = "spectator"
-		c.boardID = boardID
-		c.name = msg.Name
-
-		// Add to Redis Set
-		sKey := fmt.Sprintf("board:%d:spectators", boardID)
-		rdb.SAdd(ctx, sKey, msg.Name)
-
-		sendJSON(c, map[string]interface{}{"type": "joined", "role": "spectator", "boardId": 0})
-		subscribeToBoard(c, 0)
-
-		// Broadcast new list to everyone
-		broadcastSpectators(boardID)
-
-		// Send board state so they see current players
-		data, _ := rdb.HGetAll(ctx, fmt.Sprintf("board:%d", boardID)).Result()
-		sendJSON(c, map[string]interface{}{"type": "board_state", "board": data})
 
 	case "get_board":
 		board := fmt.Sprintf("board:%d", msg.BoardID)
 		data, _ := rdb.HGetAll(ctx, board).Result()
 		sendJSON(c, map[string]interface{}{"type": "board_state", "board": data})
-		// Also refresh spectator list for this user
-		specs, _ := rdb.SMembers(ctx, fmt.Sprintf("board:%d:spectators", msg.BoardID)).Result()
+		// Send initial queue
+		specs, _ := rdb.LRange(ctx, fmt.Sprintf("board:%d:queue", msg.BoardID), 0, -1).Result()
 		sendJSON(c, map[string]interface{}{"type": "spectators_update", "spectators": specs})
 
 	case "subscribe":
@@ -367,11 +375,11 @@ func handleClientMessage(c *client, sha string, msg Message) {
 		board := fmt.Sprintf("board:%d", msg.BoardID)
 		pos := msg.Position
 
+		// Run Lua Script
 		res, err := rdb.EvalSha(ctx, sha, []string{board}, pos, msg.Symbol).Result()
 		if err != nil {
-			sendJSON(c, map[string]string{"type": "error", "error": err.Error()})
 			return
-		}
+		} // handle error
 
 		arr, ok := res.([]interface{})
 		if !ok || len(arr) < 2 {
@@ -395,6 +403,7 @@ func handleClientMessage(c *client, sha string, msg Message) {
 			nextTurn, _ = arr[3].(string)
 		}
 
+		// Broadcast Move
 		update := map[string]interface{}{
 			"type":     "move_made",
 			"position": pos,
@@ -406,10 +415,14 @@ func handleClientMessage(c *client, sha string, msg Message) {
 		b, _ := json.Marshal(update)
 		rdb.Publish(ctx, fmt.Sprintf("board:%d", msg.BoardID), b)
 
-	case "reset":
-		resetBoardState(msg.BoardID)
-		update, _ := json.Marshal(map[string]string{"type": "reset_done"})
-		rdb.Publish(ctx, fmt.Sprintf("board:%d", msg.BoardID), update)
+		// IF GAME OVER -> ROTATE PLAYERS
+		if winner != "" {
+			// We delay slightly so players see the "Win" message, then rotate
+			go func() {
+				time.Sleep(3 * time.Second)
+				rotatePlayers(msg.BoardID)
+			}()
+		}
 	}
 }
 
