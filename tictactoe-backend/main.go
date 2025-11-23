@@ -19,11 +19,11 @@ var (
 	ctx      = context.Background()
 	rdb      *redis.Client
 	upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-
+	// Mutex for the File Database to prevent concurrent write errors
 	fileMu sync.Mutex
 )
 
-// Lua script remains the same
+// --- Lua Script for Game Logic ---
 var luaScript = `
 local board = KEYS[1]
 local pos = tonumber(ARGV[1])
@@ -102,7 +102,6 @@ else
     winner = 'draw'
     status = 'draw'
   else
-    -- toggle turn
     if turn == 'X' then turn = 'O' else turn = 'X' end
   end
 end
@@ -119,8 +118,7 @@ type Message struct {
 	Name       string            `json:"name,omitempty"`
 	Spectators []string          `json:"spectators,omitempty"`
 	Board      map[string]string `json:"board,omitempty"`
-
-	Content string `json:"content,omitempty"`
+	Content    string            `json:"content,omitempty"` // Chat Content
 }
 
 type client struct {
@@ -133,6 +131,49 @@ type client struct {
 	name    string
 	boardID int
 }
+
+// --- File Database Helpers ---
+
+func writeToDisk(msgJSON string) {
+	fileMu.Lock()
+	defer fileMu.Unlock()
+
+	// Append to file, create if not exists
+	f, err := os.OpenFile("chat_history.jsonl", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Println("DB Write Error:", err)
+		return
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(msgJSON + "\n"); err != nil {
+		log.Println("DB Write Error:", err)
+	}
+}
+
+func loadFromDisk(limit int) []string {
+	fileMu.Lock()
+	defer fileMu.Unlock()
+
+	f, err := os.Open("chat_history.jsonl")
+	if err != nil {
+		return []string{} // File doesn't exist yet
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	if len(lines) > limit {
+		return lines[len(lines)-limit:]
+	}
+	return lines
+}
+
+// --- WebSocket Logic ---
 
 func newClient(conn *websocket.Conn) *client {
 	c := &client{
@@ -157,7 +198,6 @@ func (c *client) writer() {
 	}
 }
 
-// close handles WebSocket closure and Redis cleanup
 func (c *client) close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -166,14 +206,9 @@ func (c *client) close() {
 	}
 	c.closed = true
 
-	// Cleanup: Remove user from the queue if they leave
 	if c.name != "" {
-		// remove from spectator list (Queue)
 		key := fmt.Sprintf("board:%d:queue", c.boardID)
-		rdb.LRem(ctx, key, 0, c.name) // 0 removes all occurrences
-
-		// Note: If the active player leaves, we strictly don't handle that
-		// edge case here (game pauses), but the rotation handles the rest.
+		rdb.LRem(ctx, key, 0, c.name)
 		broadcastSpectators(c.boardID)
 	}
 
@@ -186,7 +221,13 @@ func (c *client) close() {
 }
 
 func main() {
-	rdb = redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	// Support Docker (REDIS_ADDR) or Localhost
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+
+	rdb = redis.NewClient(&redis.Options{Addr: redisAddr})
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Fatal("Redis connection failed:", err)
 	}
@@ -197,14 +238,13 @@ func main() {
 		log.Fatal("Failed to load Lua script:", err)
 	}
 
-	// Initialize board 0
+	// Init board
 	for i := 0; i < 1; i++ {
 		boardKey := fmt.Sprintf("board:%d", i)
 		exists, _ := rdb.Exists(ctx, boardKey).Result()
 		if exists == 0 {
 			resetBoardState(i)
 		}
-		// clear spectators on restart
 		rdb.Del(ctx, fmt.Sprintf("board:%d:spectators", i))
 	}
 
@@ -228,7 +268,7 @@ func main() {
 		<-c.done
 	})
 
-	log.Println("🚀 Server running on http://localhost:8080")
+	log.Println("🚀 Server running on port 8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -257,9 +297,7 @@ func subscribeToBoard(c *client, boardID int) {
 	}()
 }
 
-// Helper to fetch all spectators and broadcast via PubSub
 func broadcastSpectators(boardID int) {
-	// CHANGED: Use LRANGE instead of SMEMBERS to get ordered list
 	key := fmt.Sprintf("board:%d:queue", boardID)
 	specs, _ := rdb.LRange(ctx, key, 0, -1).Result()
 
@@ -273,7 +311,6 @@ func broadcastSpectators(boardID int) {
 
 func resetBoardState(boardID int) {
 	boardKey := fmt.Sprintf("board:%d", boardID)
-	// We do NOT clear player names here, only the grid
 	rdb.HSet(ctx, boardKey,
 		"cells", "_,_,_,_,_,_,_,_,_",
 		"turn", "X",
@@ -285,11 +322,9 @@ func rotatePlayers(boardID int) {
 	boardKey := fmt.Sprintf("board:%d", boardID)
 	queueKey := fmt.Sprintf("board:%d:queue", boardID)
 
-	// 1. Get current players
 	pX, _ := rdb.HGet(ctx, boardKey, "playerXName").Result()
 	pO, _ := rdb.HGet(ctx, boardKey, "playerOName").Result()
 
-	// 2. Push current players to back of queue (if they exist)
 	if pX != "" && pX != "Waiting..." {
 		rdb.RPush(ctx, queueKey, pX)
 	}
@@ -297,33 +332,24 @@ func rotatePlayers(boardID int) {
 		rdb.RPush(ctx, queueKey, pO)
 	}
 
-	// 3. Pop new players from front of queue
-	// We try to get 2 people.
 	newX, err1 := rdb.LPop(ctx, queueKey).Result()
 	if err1 == redis.Nil {
 		newX = "Waiting..."
-	} // Queue empty
-
+	}
 	newO, err2 := rdb.LPop(ctx, queueKey).Result()
 	if err2 == redis.Nil {
 		newO = "Waiting..."
 	}
 
-	// 4. Update Board State
 	rdb.HSet(ctx, boardKey, "playerXName", newX, "playerOName", newO)
-
-	// Reset the grid for the new game
 	resetBoardState(boardID)
 
-	// 5. Notify Everyone
-	// Broadcast new board state (roles)
 	data, _ := rdb.HGetAll(ctx, boardKey).Result()
 	bBoard, _ := json.Marshal(map[string]interface{}{"type": "board_state", "board": data})
 	rdb.Publish(ctx, fmt.Sprintf("board:%d", boardID), bBoard)
-
-	// Broadcast new spectator list (since we popped and pushed)
 	broadcastSpectators(boardID)
 }
+
 func handleClientMessage(c *client, sha string, msg Message) {
 	switch msg.Type {
 	case "join":
@@ -332,13 +358,10 @@ func handleClientMessage(c *client, sha string, msg Message) {
 		c.name = msg.Name
 		boardKey := fmt.Sprintf("board:%d", boardID)
 
-		// Check if seats are empty
 		currX, _ := rdb.HGet(ctx, boardKey, "playerXName").Result()
 		currO, _ := rdb.HGet(ctx, boardKey, "playerOName").Result()
 
 		assigned := false
-
-		// Logic: If seat empty, take it. Else, go to queue.
 		if currX == "" || currX == "Waiting..." {
 			rdb.HSet(ctx, boardKey, "playerXName", msg.Name)
 			assigned = true
@@ -348,11 +371,9 @@ func handleClientMessage(c *client, sha string, msg Message) {
 		}
 
 		if !assigned {
-			// Add to Queue (Spectator List)
 			rdb.RPush(ctx, fmt.Sprintf("board:%d:queue", boardID), msg.Name)
 		}
 
-		// Reply to user
 		sendJSON(c, map[string]interface{}{
 			"type":    "joined",
 			"boardId": boardID,
@@ -360,7 +381,6 @@ func handleClientMessage(c *client, sha string, msg Message) {
 
 		subscribeToBoard(c, boardID)
 
-		// Broadcast updates
 		data, _ := rdb.HGetAll(ctx, boardKey).Result()
 		b, _ := json.Marshal(map[string]interface{}{"type": "board_state", "board": data})
 		rdb.Publish(ctx, fmt.Sprintf("board:%d", boardID), b)
@@ -370,37 +390,27 @@ func handleClientMessage(c *client, sha string, msg Message) {
 		board := fmt.Sprintf("board:%d", msg.BoardID)
 		data, _ := rdb.HGetAll(ctx, board).Result()
 		sendJSON(c, map[string]interface{}{"type": "board_state", "board": data})
-		// Send initial queue
 		specs, _ := rdb.LRange(ctx, fmt.Sprintf("board:%d:queue", msg.BoardID), 0, -1).Result()
 		sendJSON(c, map[string]interface{}{"type": "spectators_update", "spectators": specs})
 
 		// --- PURE CACHE LOGIC: READ HISTORY ---
 		chatKey := fmt.Sprintf("board:%d:chat", msg.BoardID)
 
-		// 1. Ask Redis: "Do you have data?"
+		// 1. Check Cache
 		exists, _ := rdb.Exists(ctx, chatKey).Result()
-
 		var history []string
 
 		if exists > 0 {
-			// CACHE HIT: Fast read from RAM
-			log.Println("Cache HIT: Reading from Redis")
+			// Cache HIT
 			history, _ = rdb.LRange(ctx, chatKey, 0, -1).Result()
 		} else {
-			// CACHE MISS: Slow read from Disk (DB)
-			log.Println("Cache MISS: Reading from File & Repopulating Redis")
-
-			// 1. Read from DB
+			// Cache MISS: Load from File, Populate Redis
 			history = loadFromDisk(50)
-
-			// 2. Hydrate Cache (Populate Redis)
 			if len(history) > 0 {
-				// RPush accepts multiple values, but we loop here for simplicity
 				for _, jsonMsg := range history {
 					rdb.RPush(ctx, chatKey, jsonMsg)
 				}
-				// 3. Set TTL (Time To Live). Redis forgets this after 1 hour
-				rdb.Expire(ctx, chatKey, time.Hour)
+				rdb.Expire(ctx, chatKey, time.Hour) // 1 Hour Cache TTL
 			}
 		}
 
@@ -416,11 +426,10 @@ func handleClientMessage(c *client, sha string, msg Message) {
 		board := fmt.Sprintf("board:%d", msg.BoardID)
 		pos := msg.Position
 
-		// Run Lua Script
 		res, err := rdb.EvalSha(ctx, sha, []string{board}, pos, msg.Symbol).Result()
 		if err != nil {
 			return
-		} // handle error
+		}
 
 		arr, ok := res.([]interface{})
 		if !ok || len(arr) < 2 {
@@ -444,7 +453,6 @@ func handleClientMessage(c *client, sha string, msg Message) {
 			nextTurn, _ = arr[3].(string)
 		}
 
-		// Broadcast Move
 		update := map[string]interface{}{
 			"type":     "move_made",
 			"position": pos,
@@ -456,9 +464,7 @@ func handleClientMessage(c *client, sha string, msg Message) {
 		b, _ := json.Marshal(update)
 		rdb.Publish(ctx, fmt.Sprintf("board:%d", msg.BoardID), b)
 
-		// IF GAME OVER -> ROTATE PLAYERS
 		if winner != "" {
-			// We delay slightly so players see the "Win" message, then rotate
 			go func() {
 				time.Sleep(3 * time.Second)
 				rotatePlayers(msg.BoardID)
@@ -468,7 +474,6 @@ func handleClientMessage(c *client, sha string, msg Message) {
 	case "chat":
 		chatKey := fmt.Sprintf("board:%d:chat", msg.BoardID)
 
-		// 1. Prepare Data
 		chatPayload := map[string]string{
 			"type":    "chat",
 			"name":    msg.Name,
@@ -477,20 +482,17 @@ func handleClientMessage(c *client, sha string, msg Message) {
 		jsonBytes, _ := json.Marshal(chatPayload)
 		jsonStr := string(jsonBytes)
 
-		// 2. WRITE TO DB (Persistent File)
-		// If the server crashes or Redis dies, this data is safe.
+		// 1. WRITE TO DISK (Persistence)
 		writeToDisk(jsonStr)
 
-		// 3. WRITE TO CACHE (Redis)
-		// We update the cache so the NEXT read is fast.
+		// 2. WRITE TO CACHE (Redis)
 		rdb.RPush(ctx, chatKey, jsonStr)
-		rdb.LTrim(ctx, chatKey, -50, -1)    // Keep cache small
-		rdb.Expire(ctx, chatKey, time.Hour) // Refresh the TTL
+		rdb.LTrim(ctx, chatKey, -50, -1)
+		rdb.Expire(ctx, chatKey, time.Hour)
 
-		// 4. Broadcast
+		// 3. BROADCAST
 		rdb.Publish(ctx, fmt.Sprintf("board:%d", msg.BoardID), jsonBytes)
 	}
-
 }
 
 func sendJSON(c *client, v interface{}) {
@@ -508,42 +510,4 @@ func (c *client) safeSend(b []byte) {
 	case c.send <- b:
 	default:
 	}
-}
-
-func writeToDisk(msgJSON string) {
-	fileMu.Lock()
-	defer fileMu.Unlock()
-
-	f, err := os.OpenFile("chat_history.jsonl", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Println("DB Write Error:", err)
-		return
-	}
-	defer f.Close()
-
-	if _, err := f.WriteString(msgJSON + "\n"); err != nil {
-		log.Println("DB Write Error:", err)
-	}
-}
-func loadFromDisk(limit int) []string {
-	fileMu.Lock()
-	defer fileMu.Unlock()
-
-	f, err := os.Open("chat_history.jsonl")
-	if err != nil {
-		return []string{} // File doesn't exist yet
-	}
-	defer f.Close()
-
-	var lines []string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-
-	// Return only the last 'limit' lines
-	if len(lines) > limit {
-		return lines[len(lines)-limit:]
-	}
-	return lines
 }

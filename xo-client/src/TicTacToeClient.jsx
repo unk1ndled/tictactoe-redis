@@ -1,17 +1,24 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Users, Eye, Play, RotateCcw, Wifi, WifiOff, User } from "lucide-react";
+import {
+  Users,
+  Eye,
+  Play,
+  RotateCcw,
+  Wifi,
+  WifiOff,
+  User,
+  MessageSquare,
+} from "lucide-react";
 
 export default function TicTacToeClient() {
   const [ws, setWs] = useState(null);
   const [connected, setConnected] = useState(false);
 
-  // State for user identity
   const [username, setUsername] = useState("");
-  const [hasJoined, setHasJoined] = useState(false); // Track if we passed the welcome screen
+  const [hasJoined, setHasJoined] = useState(false);
 
-  // Game State
-  const [role, setRole] = useState("spectator"); // Dynamic: changes based on board state
-  const [symbol, setSymbol] = useState(null); // 'X' or 'O' or null
+  const [role, setRole] = useState("spectator");
+  const [symbol, setSymbol] = useState(null);
   const [boardId, setBoardId] = useState(null);
   const [spectators, setSpectators] = useState([]);
   const [playerNames, setPlayerNames] = useState({
@@ -26,6 +33,7 @@ export default function TicTacToeClient() {
   const [error, setError] = useState("");
   const wsRef = useRef(null);
 
+  // --- Chat State ---
   const [chatHistory, setChatHistory] = useState([]);
   const [msgInput, setMsgInput] = useState("");
 
@@ -37,11 +45,8 @@ export default function TicTacToeClient() {
     };
   }, []);
 
-  // --- Dynamic Role Logic ---
-  // Whenever playerNames change, check if I am one of them
   useEffect(() => {
     if (!hasJoined) return;
-
     if (playerNames.X === username) {
       setRole("player");
       setSymbol("X");
@@ -58,7 +63,13 @@ export default function TicTacToeClient() {
     if (wsRef.current && wsRef.current.readyState === WebSocket.CONNECTING)
       return;
     try {
-      const socket = new WebSocket("ws://localhost:8080/ws");
+      // --- CHANGED: Dynamic Connection ---
+      // This allows it to work on localhost OR a real server IP automatically.
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const host = window.location.hostname;
+      // We assume port 8080 for the backend (mapped in Docker Compose)
+      const socket = new WebSocket(`${protocol}//${host}:8080/ws`);
+
       socket.onopen = () => {
         setConnected(true);
         setError("");
@@ -85,7 +96,6 @@ export default function TicTacToeClient() {
       case "joined":
         setHasJoined(true);
         setBoardId(data.boardId);
-        // Request immediate state
         send({ type: "get_board", boardId: data.boardId });
         break;
 
@@ -116,24 +126,15 @@ export default function TicTacToeClient() {
 
       case "chat":
         setChatHistory((prev) => [...prev, data]);
+        const chatContainer = document.getElementById("chat-container");
+        if (chatContainer) chatContainer.scrollTop = chatContainer.scrollHeight;
         break;
 
-      // NEW: Receive full history on join (parse the JSON strings from Redis)
       case "chat_history":
         const parsedHistory = data.history.map((str) => JSON.parse(str));
         setChatHistory(parsedHistory);
         break;
     }
-  };
-  const sendChat = () => {
-    if (!msgInput.trim()) return;
-    send({
-      type: "chat",
-      boardId: boardId,
-      name: username,
-      content: msgInput,
-    });
-    setMsgInput("");
   };
 
   const updateBoard = (boardData) => {
@@ -179,7 +180,16 @@ export default function TicTacToeClient() {
     });
   };
 
-  // --- Render ---
+  const sendChat = () => {
+    if (!msgInput.trim()) return;
+    send({
+      type: "chat",
+      boardId: boardId,
+      name: username,
+      content: msgInput,
+    });
+    setMsgInput("");
+  };
 
   if (!hasJoined) {
     return (
@@ -188,8 +198,9 @@ export default function TicTacToeClient() {
           <h1 className="text-4xl font-bold text-white text-center mb-2">
             Tic-Tac-Toe
           </h1>
-          <p className="text-gray-300 text-center mb-6">Redis Demo</p>
-
+          <p className="text-gray-300 text-center mb-6">
+            King of the Hill Mode
+          </p>
           <input
             type="text"
             value={username}
@@ -197,7 +208,6 @@ export default function TicTacToeClient() {
             placeholder="Enter Username"
             className="w-full bg-slate-900/50 text-white -xl py-3 px-4 mb-4 border border-slate-500/30 outline-none focus:border-slate-400"
           />
-
           <button
             onClick={joinGame}
             disabled={!connected || !username}
@@ -205,7 +215,6 @@ export default function TicTacToeClient() {
           >
             Join Lobby
           </button>
-
           <div className="mt-4 text-center">
             {connected ? (
               <span className="text-emerald-400 text-xs">● Connected</span>
@@ -220,8 +229,7 @@ export default function TicTacToeClient() {
 
   return (
     <div className="min-h-screen bg-slate-950 flex flex-col md:flex-row text-white font-sans">
-      {/* Sidebar */}
-      <div className="md:w-90 bg-slate-900/40 border-r border-white/10 p-6 flex flex-col gap-6">
+      <div className="md:w-80 bg-slate-900/40 border-r border-white/10 p-6 flex flex-col gap-6">
         <div>
           <h2 className="text-slate-300 text-xs font-bold uppercase tracking-wider mb-3">
             Current Players
@@ -259,10 +267,7 @@ export default function TicTacToeClient() {
             <span>Queue</span>
             <span>{spectators.length}</span>
           </h2>
-          <div className="flex-1 overflow-y-auto space-y-1 pr-2 custom-scrollbar">
-            {spectators.length === 0 && (
-              <div className="text-white/30 text-sm italic">Queue is empty</div>
-            )}
+          <div className="flex-1 overflow-y-auto space-y-1 pr-2 custom-scrollbar max-h-40">
             {spectators.map((name, i) => (
               <div
                 key={i}
@@ -283,40 +288,48 @@ export default function TicTacToeClient() {
               </div>
             ))}
           </div>
-          <div className="mt-4 p-4 bg-black/20  flex flex-col h-64">
-            <h3 className="text-white font-bold mb-2">Chat</h3>
+        </div>
 
-            {/* Message List */}
-            <div className="flex-1 overflow-y-auto mb-2 space-y-1 custom-scrollbar">
-              {chatHistory.map((msg, i) => (
-                <div key={i} className="text-sm">
-                  <span className="font-bold text-slate-300">{msg.name}: </span>
-                  <span className="text-gray-200">{msg.content}</span>
-                </div>
-              ))}
-            </div>
-
-            {/* Input */}
-            <div className="flex gap-2">
-              <input
-                className="flex-1 bg-white/10  px-2 py-1 outline-none text-white text-sm"
-                value={msgInput}
-                onChange={(e) => setMsgInput(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && sendChat()}
-                placeholder="Type a message..."
-              />
-              <button
-                onClick={sendChat}
-                className="bg-slate-600 px-3  text-sm hover:bg-slate-500"
-              >
-                Send
-              </button>
-            </div>
+        <div className="flex flex-col h-64 border-t border-white/10 pt-4">
+          <h2 className="text-slate-300 text-xs font-bold uppercase tracking-wider mb-3 flex items-center gap-2">
+            <MessageSquare size={12} /> Chat
+          </h2>
+          <div
+            id="chat-container"
+            className="flex-1 overflow-y-auto space-y-2 mb-2 pr-2 custom-scrollbar bg-black/20  p-2"
+          >
+            {chatHistory.length === 0 && (
+              <div className="text-white/20 text-xs text-center mt-4">
+                No messages yet...
+              </div>
+            )}
+            {chatHistory.map((msg, i) => (
+              <div key={i} className="text-xs break-words">
+                <span
+                  className={`font-bold mr-2 ${
+                    msg.name === username
+                      ? "text-emerald-400"
+                      : "text-slate-300"
+                  }`}
+                >
+                  {msg.name}:
+                </span>
+                <span className="text-gray-300">{msg.content}</span>
+              </div>
+            ))}
+          </div>
+          <div className="flex gap-2">
+            <input
+              className="flex-1 bg-white/10  px-2 py-1 outline-none text-white text-sm focus:bg-white/20 transition-colors"
+              value={msgInput}
+              onChange={(e) => setMsgInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && sendChat()}
+              placeholder="Message..."
+            />
           </div>
         </div>
       </div>
 
-      {/* Game Area */}
       <div className="flex-1 flex flex-col relative">
         <div className="p-4 bg-slate-900/20 flex justify-between items-center">
           <div className="flex items-center gap-2">
@@ -367,7 +380,7 @@ export default function TicTacToeClient() {
             )}
           </div>
 
-          <div className="grid grid-cols-3 gap-5 max-w-sm w-full  ">
+          <div className="grid grid-cols-3 gap-5 max-w-sm w-full">
             {board.cells.map((cell, index) => (
               <button
                 key={index}
@@ -379,7 +392,7 @@ export default function TicTacToeClient() {
                   cell !== "_"
                 }
                 className={`
-                    aspect-square -xl text-5xl font-bold  shadow-lg  transition-all transform
+                    aspect-square -xl text-5xl font-bold shadow-lg transition-all transform
                     ${
                       cell === "_"
                         ? "bg-white/10 hover:bg-white/15"
@@ -391,7 +404,7 @@ export default function TicTacToeClient() {
                       board.turn === symbol &&
                       !board.winner &&
                       cell === "_"
-                        ? "border-2 border-slate-500/50 hover:scale-120 "
+                        ? "border-2 border-slate-500/50 hover:scale-110"
                         : ""
                     }
                     `}
