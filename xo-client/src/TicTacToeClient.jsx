@@ -58,7 +58,7 @@ export default function TicTacToeClient() {
 
       socket.onerror = (error) => {
         console.error("WebSocket error:", error);
-        setError("Cannot connect to server. Is it running on port 8080?");
+        setError("Cannot connect to server.");
       };
 
       socket.onmessage = (event) => {
@@ -190,23 +190,21 @@ export default function TicTacToeClient() {
   // Welcome Screen
   if (!role) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
-        <div className="bg-white rounded-2xl shadow-2xl p-8 max-w-md w-full">
+      <div className="min-h-screen bg-indigo-950 flex items-center justify-center p-4">
+        <div className=" p-8 max-w-md w-full">
           <div className="text-center mb-8">
-            <h1 className="text-4xl font-bold text-gray-800 mb-2">
-              Tic-Tac-Toe
-            </h1>
-            <p className="text-gray-600">Redis + Lua Demo</p>
-            <div className="flex items-center justify-center mt-4 gap-2">
+            <h1 className="text-4xl font-bold text-white mb-2">Tic-Tac-Toe</h1>
+            <p className="text-gray-600">Redis Demo</p>
+            <div className="flex items-center justify-center mt-4 gap-2  text-sm hover:text-2xl transition-all">
               {connected ? (
                 <>
-                  <Wifi className="w-5 h-5 text-green-500" />
-                  <span className="text-green-600 text-sm">Connected</span>
+                  <Wifi className="w-5 h-5 text-emerald-500" />
+                  <span className="text-emerald-600 ">Connected</span>
                 </>
               ) : (
                 <>
                   <WifiOff className="w-5 h-5 text-red-500" />
-                  <span className="text-red-600 text-sm">Connecting...</span>
+                  <span className="text-red-600 ">Connecting...</span>
                 </>
               )}
             </div>
@@ -216,7 +214,7 @@ export default function TicTacToeClient() {
             <button
               onClick={joinAsPlayer}
               disabled={!connected}
-              className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white font-semibold py-4 px-6 rounded-xl transition-all transform hover:scale-105 flex items-center justify-center gap-3"
+              className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white font-semibold py-4 px-6  transition-all transform hover:scale-105 flex items-center justify-center gap-3"
             >
               <Play className="w-6 h-6" />
               Join as Player
@@ -225,7 +223,7 @@ export default function TicTacToeClient() {
             <button
               onClick={joinAsSpectator}
               disabled={!connected}
-              className="w-full bg-gray-600 hover:bg-gray-700 disabled:bg-gray-300 text-white font-semibold py-4 px-6 rounded-xl transition-all transform hover:scale-105 flex items-center justify-center gap-3"
+              className="w-full bg-gray-600 hover:bg-gray-700 disabled:bg-gray-300 text-white font-semibold py-4 px-6 -xl transition-all transform hover:scale-105 flex items-center justify-center gap-3"
             >
               <Eye className="w-6 h-6" />
               Watch as Spectator
@@ -233,16 +231,16 @@ export default function TicTacToeClient() {
           </div>
 
           {error && (
-            <div className="mt-4 p-4 bg-red-100 border-l-4 border-red-500 text-red-700 rounded text-sm">
+            <div className="mt-4 p-4 bg-red-100 border-l-4 border-red-500 text-red-700  text-sm">
               <p className="font-semibold">Connection Error</p>
               <p className="mt-1">{error}</p>
               <p className="mt-2 text-xs">
                 Make sure the Go server is running:{" "}
-                <code className="bg-red-200 px-1 rounded">go run main.go</code>
+                <code className="bg-red-200 px-1 ">go run main.go</code>
               </p>
               <button
                 onClick={connectWebSocket}
-                className="mt-3 w-full bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded transition-all"
+                className="mt-3 w-full bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4  transition-all"
               >
                 Retry Connection
               </button>
@@ -255,67 +253,63 @@ export default function TicTacToeClient() {
 
   // Game Screen
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
-      <div className="max-w-2xl mx-auto">
+    <div className="min-h-screen bg-indigo-950 ">
+      <div className=" mx-auto">
         {/* Header */}
-        <div className="bg-white rounded-2xl shadow-lg p-6 mb-6">
+        <div className="bg-slate-300  -2xl shadow-lg p-6 mb-6">
+          <div className="w-full flex justify-center items-center gap-2">
+            <span className="text-2xl font-bold capitalize text-indigo-950">
+              server connection state{" "}
+            </span>
+            {connected ? (
+              <Wifi className="w-10 h-10 text-emerald-500" />
+            ) : (
+              <WifiOff className="w-10 h-10 text-red-500" />
+            )}
+          </div>
           <div className="flex items-center justify-between">
-            <div>
-              <h1 className="text-3xl font-bold text-gray-800">
-                Board #{boardId}
-              </h1>
-              <div className="flex items-center gap-4 mt-2">
-                <div className="flex items-center gap-2">
-                  {role === "player" ? (
-                    <Users className="w-5 h-5 text-indigo-600" />
-                  ) : (
-                    <Eye className="w-5 h-5 text-gray-600" />
-                  )}
-                  <span className="text-sm font-medium text-gray-600">
-                    {role === "player" ? `Playing as ${symbol}` : "Spectating"}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  {connected ? (
-                    <Wifi className="w-4 h-4 text-green-500" />
-                  ) : (
-                    <WifiOff className="w-4 h-4 text-red-500" />
-                  )}
-                </div>
-              </div>
+            <div className="flex hover:text-3xl transition-all items-center gap-2">
+              {role === "player" ? (
+                <Users className="w-5 h-5 text-indigo-950" />
+              ) : (
+                <Eye className="w-5 h-5 text-gray-600" />
+              )}
+              <span className=" font-medium text-gray-600">
+                {role === "player" ? `Playing as ${symbol}` : "Spectating"}
+              </span>
             </div>
+
+            {/* Turn Indicator */}
+            {!board.winner && (
+              <div className=" ">
+                <p className="text-center text-5xl text-indigo-950 font-semibold">
+                  {role === "player" && board.turn === symbol ? (
+                    <span className="text-emerald-500  font-bold">
+                      Your turn! ({symbol})
+                    </span>
+                  ) : (
+                    <span>{board.turn}'s turn</span>
+                  )}
+                </p>
+              </div>
+            )}
             <button
               onClick={resetBoard}
-              className="bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold py-2 px-4 rounded-lg transition-all flex items-center gap-2"
+              className="bg-slate-300 hover:text-3xl text-gray-700 font-semibold  -lg transition-all flex items-center gap-2"
             >
               <RotateCcw className="w-4 h-4" />
               Reset
             </button>
           </div>
 
-          {/* Turn Indicator */}
-          {!board.winner && (
-            <div className="mt-4 p-3 bg-blue-50 rounded-lg">
-              <p className="text-center text-blue-800 font-medium">
-                {role === "player" && board.turn === symbol ? (
-                  <span className="text-green-600 font-bold">
-                    Your turn! ({symbol})
-                  </span>
-                ) : (
-                  <span>Turn: {board.turn}</span>
-                )}
-              </p>
-            </div>
-          )}
-
           {/* Winner */}
           {board.winner && (
-            <div className="mt-4 p-4 bg-gradient-to-r from-green-400 to-blue-500 rounded-lg">
+            <div className="mt-4 p-4 bg-indigo-950 -lg">
               <p className="text-center text-white text-xl font-bold">
                 {board.winner === "draw"
                   ? "It's a Draw!"
                   : board.winner === symbol
-                  ? "🎉 You Won!"
+                  ? " You Won!"
                   : `${board.winner} Wins!`}
               </p>
             </div>
@@ -323,14 +317,14 @@ export default function TicTacToeClient() {
 
           {/* Error Message */}
           {error && (
-            <div className="mt-4 p-3 bg-red-100 border border-red-400 text-red-700 rounded-lg text-sm">
+            <div className="mt-4 p-3 bg-red-100 border border-red-400 text-red-700 -lg text-sm">
               {error}
             </div>
           )}
         </div>
 
         {/* Game Board */}
-        <div className="bg-white rounded-2xl shadow-lg p-8">
+        <div className="  p-8">
           <div className="grid grid-cols-3 gap-3 max-w-md mx-auto">
             {board.cells.map((cell, index) => (
               <button
@@ -343,12 +337,12 @@ export default function TicTacToeClient() {
                   cell !== "_"
                 }
                 className={`
-                  aspect-square rounded-xl text-5xl font-bold transition-all
+                  aspect-square -xl text-5xl font-bold transition-all
                   ${
                     cell === "X"
-                      ? "text-blue-600"
+                      ? "text-amber-500"
                       : cell === "O"
-                      ? "text-red-600"
+                      ? "text-cyan-500"
                       : "text-gray-300"
                   }
                   ${
@@ -357,7 +351,7 @@ export default function TicTacToeClient() {
                     board.turn === symbol &&
                     cell === "_"
                       ? "bg-indigo-50 hover:bg-indigo-100 cursor-pointer transform hover:scale-105"
-                      : "bg-gray-50 cursor-not-allowed"
+                      : "bg-indigo-800/50 cursor-not-allowed"
                   }
                   ${board.winner ? "opacity-60" : ""}
                   shadow-md hover:shadow-lg
@@ -367,27 +361,6 @@ export default function TicTacToeClient() {
               </button>
             ))}
           </div>
-        </div>
-
-        {/* Instructions */}
-        <div className="mt-6 bg-white rounded-2xl shadow-lg p-6">
-          <h3 className="font-bold text-gray-800 mb-2">How it works:</h3>
-          <ul className="text-sm text-gray-600 space-y-1">
-            <li>
-              • <strong>Players:</strong> Wait for your turn and click a cell to
-              play
-            </li>
-            <li>
-              • <strong>Spectators:</strong> Watch the game in real-time
-            </li>
-            <li>
-              • <strong>Redis Lua:</strong> All moves validated atomically
-            </li>
-            <li>
-              • <strong>Pub/Sub:</strong> Updates broadcast instantly to all
-              viewers
-            </li>
-          </ul>
         </div>
       </div>
     </div>
