@@ -19,10 +19,7 @@ var (
 	upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 )
 
-// Embedded Lua script (atomic move validation + update)
-// KEYS[1] - board key
-// ARGV[1] - position (1..9)
-// ARGV[2] - symbol ("X" or "O")
+// Lua script remains the same
 var luaScript = `
 local board = KEYS[1]
 local pos = tonumber(ARGV[1])
@@ -106,28 +103,31 @@ else
   end
 end
 
--- persist
 redis.call('HSET', board, 'cells', join(cellTbl), 'turn', turn, 'winner', winner)
-
 return { status, join(cellTbl), winner, turn }
 `
 
-// Message is the JSON shape received from clients
 type Message struct {
-	Type     string `json:"type"`
-	BoardID  int    `json:"boardId,omitempty"`
-	Position int    `json:"position,omitempty"`
-	Symbol   string `json:"symbol,omitempty"`
+	Type       string            `json:"type"`
+	BoardID    int               `json:"boardId,omitempty"`
+	Position   int               `json:"position,omitempty"`
+	Symbol     string            `json:"symbol,omitempty"`
+	Name       string            `json:"name,omitempty"`       // <-- Added Name
+	Spectators []string          `json:"spectators,omitempty"` // <-- For broadcasting lists
+	Board      map[string]string `json:"board,omitempty"`      // <-- Fixed type for HGetAll
 }
 
-// client wraps a websocket connection and a single writer goroutine
 type client struct {
 	conn   *websocket.Conn
 	send   chan []byte
-	mu     sync.Mutex // protects closed
+	mu     sync.Mutex
 	closed bool
 	pubsub *redis.PubSub
 	done   chan struct{}
+	// State to track for cleanup on disconnect
+	name    string
+	role    string
+	boardID int
 }
 
 func newClient(conn *websocket.Conn) *client {
@@ -153,6 +153,7 @@ func (c *client) writer() {
 	}
 }
 
+// close handles WebSocket closure and Redis cleanup
 func (c *client) close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -160,6 +161,22 @@ func (c *client) close() {
 		return
 	}
 	c.closed = true
+
+	// --- Cleanup Logic ---
+	if c.name != "" {
+		log.Printf("Cleaning up user: %s (%s)", c.name, c.role)
+		if c.role == "spectator" {
+			key := fmt.Sprintf("board:%d:spectators", c.boardID)
+			rdb.SRem(ctx, key, c.name)
+			broadcastSpectators(c.boardID)
+		} else if c.role == "player" {
+			// Optional: clear the player seat if they disconnect?
+			// For now, we keep the game state, but maybe announce they left.
+			// To reset fully, we'd set playerX="" in Redis.
+		}
+	}
+	// ---------------------
+
 	close(c.done)
 	if c.pubsub != nil {
 		_ = c.pubsub.Close()
@@ -169,86 +186,61 @@ func (c *client) close() {
 }
 
 func main() {
-	// Connect to Redis
 	rdb = redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Fatal("Redis connection failed:", err)
 	}
 	defer rdb.Close()
 
-	// Load Lua script
 	sha, err := rdb.ScriptLoad(ctx, luaScript).Result()
 	if err != nil {
 		log.Fatal("Failed to load Lua script:", err)
 	}
-	log.Printf("✓ Lua script loaded (sha=%s)", sha)
 
-	// Initialize 9 boards if not present
+	// Initialize board 0
 	for i := 0; i < 1; i++ {
 		boardKey := fmt.Sprintf("board:%d", i)
 		exists, _ := rdb.Exists(ctx, boardKey).Result()
 		if exists == 0 {
-			rdb.HSet(ctx, boardKey,
-				"cells", "_,_,_,_,_,_,_,_,_",
-				"turn", "X",
-				"winner", "",
-				"playerX", "",
-				"playerO", "",
-			)
+			resetBoardState(i)
 		}
+		// clear spectators on restart
+		rdb.Del(ctx, fmt.Sprintf("board:%d:spectators", i))
 	}
-	log.Println("✓ Boards initialized")
 
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Println("upgrade error:", err)
 			return
 		}
 		c := newClient(conn)
-		log.Println("New WebSocket connection")
 
-		// reader loop
 		go func() {
 			for {
 				var msg Message
 				if err := conn.ReadJSON(&msg); err != nil {
-					log.Println("read error:", err)
 					c.close()
 					return
 				}
-
 				handleClientMessage(c, sha, msg)
 			}
 		}()
 
-		// block until client done
 		<-c.done
-		log.Println("Connection closed")
-	})
-
-	// status page
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<h1>Redis Tic-Tac-Toe (fixed)</h1><p>WebSocket: ws://localhost:8080/ws</p>`))
 	})
 
 	log.Println("🚀 Server running on http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// handleClientMessage handles messages and uses c.send to push replies
-// Add this helper function above or below handleClientMessage
 func subscribeToBoard(c *client, boardID int) {
-	// Prevent double subscription
 	if c.pubsub != nil {
 		return
 	}
-
 	channel := fmt.Sprintf("board:%d", boardID)
 	pubsub := rdb.Subscribe(ctx, channel)
 	c.pubsub = pubsub
 
-	// Start listening in a background goroutine
 	go func() {
 		defer pubsub.Close()
 		ch := pubsub.Channel()
@@ -266,15 +258,40 @@ func subscribeToBoard(c *client, boardID int) {
 	}()
 }
 
-// Update your main handler
+// Helper to fetch all spectators and broadcast via PubSub
+func broadcastSpectators(boardID int) {
+	key := fmt.Sprintf("board:%d:spectators", boardID)
+	specs, _ := rdb.SMembers(ctx, key).Result()
+
+	msg := Message{
+		Type:       "spectators_update",
+		Spectators: specs,
+	}
+
+	b, _ := json.Marshal(msg)
+	rdb.Publish(ctx, fmt.Sprintf("board:%d", boardID), b)
+}
+
+func resetBoardState(boardID int) {
+	boardKey := fmt.Sprintf("board:%d", boardID)
+	rdb.HSet(ctx, boardKey,
+		"cells", "_,_,_,_,_,_,_,_,_",
+		"turn", "X",
+		"winner", "",
+		"playerX", "",
+		"playerO", "",
+		"playerXName", "Waiting...",
+		"playerOName", "Waiting...",
+	)
+}
+
 func handleClientMessage(c *client, sha string, msg Message) {
 	switch msg.Type {
 	case "join":
-		boardID := 0 // Hardcoded for now as per your logic
+		boardID := 0
 		symbol := "X"
 		boardKey := fmt.Sprintf("board:%d", boardID)
 
-		// Check existing players
 		playerX, _ := rdb.HGet(ctx, boardKey, "playerX").Result()
 		playerO, _ := rdb.HGet(ctx, boardKey, "playerO").Result()
 
@@ -283,18 +300,21 @@ func handleClientMessage(c *client, sha string, msg Message) {
 			return
 		}
 
-		// Assign Role
 		if playerX != "" {
 			symbol = "O"
 		}
 
-		playerKey := "player" + symbol
-		rdb.HSet(ctx, boardKey, playerKey, "player-"+symbol)
-		if symbol == "O" || (playerX != "" && symbol == "X") {
-			rdb.HSet(ctx, boardKey, "status", "active")
-		}
+		// Store Client Info
+		c.role = "player"
+		c.boardID = boardID
+		c.name = msg.Name
 
-		// 1. Send Join Confirmation
+		// Update Redis
+		playerKey := "player" + symbol              // e.g. playerX
+		playerNameKey := "player" + symbol + "Name" // e.g. playerXName
+
+		rdb.HSet(ctx, boardKey, playerKey, "active", playerNameKey, msg.Name)
+
 		sendJSON(c, map[string]interface{}{
 			"type":    "joined",
 			"role":    "player",
@@ -302,38 +322,59 @@ func handleClientMessage(c *client, sha string, msg Message) {
 			"symbol":  symbol,
 		})
 
-		// 2. CRITICAL FIX: Auto-subscribe to Redis immediately
 		subscribeToBoard(c, boardID)
 
+		// Force a board update so everyone sees the new player name
+		data, _ := rdb.HGetAll(ctx, boardKey).Result()
+		b, _ := json.Marshal(map[string]interface{}{"type": "board_state", "board": data})
+		rdb.Publish(ctx, fmt.Sprintf("board:%d", boardID), b)
+
+		// Also send current spectators to the new player
+		broadcastSpectators(boardID)
+
 	case "join_spectator":
+		boardID := 0
+		c.role = "spectator"
+		c.boardID = boardID
+		c.name = msg.Name
+
+		// Add to Redis Set
+		sKey := fmt.Sprintf("board:%d:spectators", boardID)
+		rdb.SAdd(ctx, sKey, msg.Name)
+
 		sendJSON(c, map[string]interface{}{"type": "joined", "role": "spectator", "boardId": 0})
-		// Spectators also need to see updates!
 		subscribeToBoard(c, 0)
+
+		// Broadcast new list to everyone
+		broadcastSpectators(boardID)
+
+		// Send board state so they see current players
+		data, _ := rdb.HGetAll(ctx, fmt.Sprintf("board:%d", boardID)).Result()
+		sendJSON(c, map[string]interface{}{"type": "board_state", "board": data})
 
 	case "get_board":
 		board := fmt.Sprintf("board:%d", msg.BoardID)
 		data, _ := rdb.HGetAll(ctx, board).Result()
 		sendJSON(c, map[string]interface{}{"type": "board_state", "board": data})
+		// Also refresh spectator list for this user
+		specs, _ := rdb.SMembers(ctx, fmt.Sprintf("board:%d:spectators", msg.BoardID)).Result()
+		sendJSON(c, map[string]interface{}{"type": "spectators_update", "spectators": specs})
 
 	case "subscribe":
-		// You can keep this for manual subscriptions, or rely on the auto-join
 		subscribeToBoard(c, msg.BoardID)
 
 	case "move":
 		board := fmt.Sprintf("board:%d", msg.BoardID)
 		pos := msg.Position
 
-		// Execute Lua Script
 		res, err := rdb.EvalSha(ctx, sha, []string{board}, pos, msg.Symbol).Result()
 		if err != nil {
-			log.Println("move error:", err)
 			sendJSON(c, map[string]string{"type": "error", "error": err.Error()})
 			return
 		}
 
 		arr, ok := res.([]interface{})
 		if !ok || len(arr) < 2 {
-			sendJSON(c, map[string]string{"type": "error", "error": "invalid response from lua"})
 			return
 		}
 
@@ -354,47 +395,29 @@ func handleClientMessage(c *client, sha string, msg Message) {
 			nextTurn, _ = arr[3].(string)
 		}
 
-		// Construct broadcast message
 		update := map[string]interface{}{
 			"type":     "move_made",
 			"position": pos,
 			"symbol":   msg.Symbol,
 			"cells":    newCells,
-			"turn":     nextTurn, // <-- NEW
-		}
-
-		if winner != "" {
-			update["winner"] = winner
+			"turn":     nextTurn,
+			"winner":   winner,
 		}
 		b, _ := json.Marshal(update)
-
-		channel := fmt.Sprintf("board:%d", msg.BoardID)
-
-		// Publish to everyone (including the player who made the move)
-		rdb.Publish(ctx, channel, b)
-
-		// Note: You previously had c.safeSend(b) here.
-		// Since the mover is now subscribed via 'join', they will receive the
-		// message via Redis PubSub. You can remove c.safeSend(b) to avoid
-		// the mover receiving the update twice.
+		rdb.Publish(ctx, fmt.Sprintf("board:%d", msg.BoardID), b)
 
 	case "reset":
-		board := fmt.Sprintf("board:%d", msg.BoardID)
-		rdb.HSet(ctx, board, "cells", "_,_,_,_,_,_,_,_,_", "turn", "X", "winner", "", "playerX", "", "playerO", "")
-
-		// Notify everyone that board was reset
+		resetBoardState(msg.BoardID)
 		update, _ := json.Marshal(map[string]string{"type": "reset_done"})
 		rdb.Publish(ctx, fmt.Sprintf("board:%d", msg.BoardID), update)
 	}
 }
 
-// sendJSON marshals v and queues it to the client's send channel
 func sendJSON(c *client, v interface{}) {
 	b, _ := json.Marshal(v)
 	c.safeSend(b)
 }
 
-// safeSend attempts to push to the client's send channel without panic if closed
 func (c *client) safeSend(b []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -404,7 +427,5 @@ func (c *client) safeSend(b []byte) {
 	select {
 	case c.send <- b:
 	default:
-		// avoid blocking if client is slow; drop message or consider buffering more
-		log.Println("dropping message to slow client")
 	}
 }
