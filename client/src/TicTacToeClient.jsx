@@ -63,13 +63,14 @@ export default function TicTacToeClient() {
     if (wsRef.current && wsRef.current.readyState === WebSocket.CONNECTING)
       return;
     try {
-      // --- CHANGED: Dynamic Connection ---
-      // This allows it to work on localhost OR a real server IP automatically.
+      // --- FIX: Dynamic Connection ---
+      // Instead of hardcoding localhost:8080, we use the current window host.
+      // Since Nginx serves both the site and the WebSocket on port 80, this works perfectly.
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const host = window.location.hostname;
-      // We assume port 8080 for the backend (mapped in Docker Compose)
-      const socket = new WebSocket(`${protocol}//${host}:8080/ws`);
+      const host = window.location.host; // e.g. "localhost" or "192.168.x.x"
+      const socketUrl = `${protocol}//${host}/ws`;
 
+      const socket = new WebSocket(socketUrl);
       socket.onopen = () => {
         setConnected(true);
         setError("");
@@ -124,8 +125,10 @@ export default function TicTacToeClient() {
         setTimeout(() => setError(""), 3000);
         break;
 
+      // --- Chat Handlers ---
       case "chat":
         setChatHistory((prev) => [...prev, data]);
+        // Auto-scroll
         const chatContainer = document.getElementById("chat-container");
         if (chatContainer) chatContainer.scrollTop = chatContainer.scrollHeight;
         break;
@@ -191,10 +194,12 @@ export default function TicTacToeClient() {
     setMsgInput("");
   };
 
+  // --- Render ---
+
   if (!hasJoined) {
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4 font-sans">
-        <div className="bg-white/10 backdrop-blur-lg border border-white/20 p-8 -2xl max-w-md w-full shadow-2xl">
+        <div className="bg-white/10 backdrop-blur-lg border border-white/20 p-8 max-w-md w-full shadow-2xl">
           <h1 className="text-4xl font-bold text-white text-center mb-2">
             Tic-Tac-Toe
           </h1>
@@ -206,12 +211,12 @@ export default function TicTacToeClient() {
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             placeholder="Enter Username"
-            className="w-full bg-slate-900/50 text-white -xl py-3 px-4 mb-4 border border-slate-500/30 outline-none focus:border-slate-400"
+            className="w-full bg-slate-900/50 text-white  py-3 px-4 mb-4 border border-slate-500/30 outline-none focus:border-slate-400"
           />
           <button
             onClick={joinGame}
             disabled={!connected || !username}
-            className="w-full bg-slate-600 hover:bg-slate-500 text-white font-bold py-3 px-6 -xl transition-all disabled:opacity-50"
+            className="w-full bg-slate-600 hover:bg-slate-500 text-white font-bold py-3 px-6  transition-all disabled:opacity-50"
           >
             Join Lobby
           </button>
@@ -229,6 +234,7 @@ export default function TicTacToeClient() {
 
   return (
     <div className="min-h-screen bg-slate-950 flex flex-col md:flex-row text-white font-sans">
+      {/* Sidebar */}
       <div className="md:w-80 bg-slate-900/40 border-r border-white/10 p-6 flex flex-col gap-6">
         <div>
           <h2 className="text-slate-300 text-xs font-bold uppercase tracking-wider mb-3">
@@ -236,7 +242,7 @@ export default function TicTacToeClient() {
           </h2>
           <div className="space-y-2">
             <div
-              className={`p-3 -lg border ${
+              className={`p-3  border ${
                 board.turn === "X"
                   ? "bg-amber-500/20 border-amber-500"
                   : "bg-white/5 border-white/10"
@@ -248,7 +254,7 @@ export default function TicTacToeClient() {
               </div>
             </div>
             <div
-              className={`p-3 -lg border ${
+              className={`p-3  border ${
                 board.turn === "O"
                   ? "bg-cyan-500/20 border-cyan-500"
                   : "bg-white/5 border-white/10"
@@ -290,6 +296,7 @@ export default function TicTacToeClient() {
           </div>
         </div>
 
+        {/* --- Chat Component --- */}
         <div className="flex flex-col h-64 border-t border-white/10 pt-4">
           <h2 className="text-slate-300 text-xs font-bold uppercase tracking-wider mb-3 flex items-center gap-2">
             <MessageSquare size={12} /> Chat
@@ -330,6 +337,7 @@ export default function TicTacToeClient() {
         </div>
       </div>
 
+      {/* Game Area */}
       <div className="flex-1 flex flex-col relative">
         <div className="p-4 bg-slate-900/20 flex justify-between items-center">
           <div className="flex items-center gap-2">
@@ -392,7 +400,7 @@ export default function TicTacToeClient() {
                   cell !== "_"
                 }
                 className={`
-                    aspect-square -xl text-5xl font-bold shadow-lg transition-all transform
+                    aspect-square  text-5xl font-bold shadow-lg transition-all transform
                     ${
                       cell === "_"
                         ? "bg-white/10 hover:bg-white/15"
