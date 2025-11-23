@@ -26,6 +26,9 @@ export default function TicTacToeClient() {
   const [error, setError] = useState("");
   const wsRef = useRef(null);
 
+  const [chatHistory, setChatHistory] = useState([]);
+  const [msgInput, setMsgInput] = useState("");
+
   useEffect(() => {
     const timer = setTimeout(() => connectWebSocket(), 100);
     return () => {
@@ -110,7 +113,27 @@ export default function TicTacToeClient() {
         setError(data.error);
         setTimeout(() => setError(""), 3000);
         break;
+
+      case "chat":
+        setChatHistory((prev) => [...prev, data]);
+        break;
+
+      // NEW: Receive full history on join (parse the JSON strings from Redis)
+      case "chat_history":
+        const parsedHistory = data.history.map((str) => JSON.parse(str));
+        setChatHistory(parsedHistory);
+        break;
     }
+  };
+  const sendChat = () => {
+    if (!msgInput.trim()) return;
+    send({
+      type: "chat",
+      boardId: boardId,
+      name: username,
+      content: msgInput,
+    });
+    setMsgInput("");
   };
 
   const updateBoard = (boardData) => {
@@ -160,27 +183,25 @@ export default function TicTacToeClient() {
 
   if (!hasJoined) {
     return (
-      <div className="min-h-screen bg-indigo-950 flex items-center justify-center p-4 font-sans">
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4 font-sans">
         <div className="bg-white/10 backdrop-blur-lg border border-white/20 p-8 -2xl max-w-md w-full shadow-2xl">
           <h1 className="text-4xl font-bold text-white text-center mb-2">
             Tic-Tac-Toe
           </h1>
-          <p className="text-gray-300 text-center mb-6">
-            King of the Hill Mode
-          </p>
+          <p className="text-gray-300 text-center mb-6">Redis Demo</p>
 
           <input
             type="text"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             placeholder="Enter Username"
-            className="w-full bg-indigo-900/50 text-white -xl py-3 px-4 mb-4 border border-indigo-500/30 outline-none focus:border-indigo-400"
+            className="w-full bg-slate-900/50 text-white -xl py-3 px-4 mb-4 border border-slate-500/30 outline-none focus:border-slate-400"
           />
 
           <button
             onClick={joinGame}
             disabled={!connected || !username}
-            className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3 px-6 -xl transition-all disabled:opacity-50"
+            className="w-full bg-slate-600 hover:bg-slate-500 text-white font-bold py-3 px-6 -xl transition-all disabled:opacity-50"
           >
             Join Lobby
           </button>
@@ -198,11 +219,11 @@ export default function TicTacToeClient() {
   }
 
   return (
-    <div className="min-h-screen bg-indigo-950 flex flex-col md:flex-row text-white font-sans">
+    <div className="min-h-screen bg-slate-950 flex flex-col md:flex-row text-white font-sans">
       {/* Sidebar */}
-      <div className="md:w-80 bg-indigo-900/40 border-r border-white/10 p-6 flex flex-col gap-6">
+      <div className="md:w-90 bg-slate-900/40 border-r border-white/10 p-6 flex flex-col gap-6">
         <div>
-          <h2 className="text-indigo-300 text-xs font-bold uppercase tracking-wider mb-3">
+          <h2 className="text-slate-300 text-xs font-bold uppercase tracking-wider mb-3">
             Current Players
           </h2>
           <div className="space-y-2">
@@ -234,7 +255,7 @@ export default function TicTacToeClient() {
         </div>
 
         <div className="flex-1 flex flex-col min-h-0">
-          <h2 className="text-indigo-300 text-xs font-bold uppercase tracking-wider mb-3 flex justify-between">
+          <h2 className="text-slate-300 text-xs font-bold uppercase tracking-wider mb-3 flex justify-between">
             <span>Queue</span>
             <span>{spectators.length}</span>
           </h2>
@@ -253,7 +274,7 @@ export default function TicTacToeClient() {
                 <span
                   className={
                     name === username
-                      ? "text-indigo-300 font-bold"
+                      ? "text-slate-300 font-bold"
                       : "text-gray-300"
                   }
                 >
@@ -262,12 +283,42 @@ export default function TicTacToeClient() {
               </div>
             ))}
           </div>
+          <div className="mt-4 p-4 bg-black/20  flex flex-col h-64">
+            <h3 className="text-white font-bold mb-2">Chat</h3>
+
+            {/* Message List */}
+            <div className="flex-1 overflow-y-auto mb-2 space-y-1 custom-scrollbar">
+              {chatHistory.map((msg, i) => (
+                <div key={i} className="text-sm">
+                  <span className="font-bold text-slate-300">{msg.name}: </span>
+                  <span className="text-gray-200">{msg.content}</span>
+                </div>
+              ))}
+            </div>
+
+            {/* Input */}
+            <div className="flex gap-2">
+              <input
+                className="flex-1 bg-white/10  px-2 py-1 outline-none text-white text-sm"
+                value={msgInput}
+                onChange={(e) => setMsgInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && sendChat()}
+                placeholder="Type a message..."
+              />
+              <button
+                onClick={sendChat}
+                className="bg-slate-600 px-3  text-sm hover:bg-slate-500"
+              >
+                Send
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
       {/* Game Area */}
       <div className="flex-1 flex flex-col relative">
-        <div className="p-4 bg-indigo-900/20 flex justify-between items-center">
+        <div className="p-4 bg-slate-900/20 flex justify-between items-center">
           <div className="flex items-center gap-2">
             <div
               className={`w-2 h-2 -full ${
@@ -281,7 +332,7 @@ export default function TicTacToeClient() {
             </span>
           </div>
           {role === "player" && (
-            <div className="text-xs bg-indigo-600 px-2 py-1 ">
+            <div className="text-xs bg-slate-600 px-2 py-1 ">
               You are PLAYING!
             </div>
           )}
@@ -290,7 +341,7 @@ export default function TicTacToeClient() {
         <div className="flex-1 flex flex-col items-center justify-center p-8">
           <div className="mb-8 text-center h-16">
             {board.winner ? (
-              <div className="animate-bounce px-6 py-2 bg-white text-indigo-900 -full text-xl font-bold shadow-lg">
+              <div className="animate-bounce px-6 py-2 bg-white text-slate-900 -full text-xl font-bold shadow-lg">
                 {board.winner === "draw"
                   ? "It's a Draw!"
                   : `${
@@ -340,7 +391,7 @@ export default function TicTacToeClient() {
                       board.turn === symbol &&
                       !board.winner &&
                       cell === "_"
-                        ? "border-2 border-indigo-500/50 hover:scale-120 "
+                        ? "border-2 border-slate-500/50 hover:scale-120 "
                         : ""
                     }
                     `}

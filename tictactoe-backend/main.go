@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -17,6 +19,8 @@ var (
 	ctx      = context.Background()
 	rdb      *redis.Client
 	upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
+	fileMu sync.Mutex
 )
 
 // Lua script remains the same
@@ -115,6 +119,8 @@ type Message struct {
 	Name       string            `json:"name,omitempty"`
 	Spectators []string          `json:"spectators,omitempty"`
 	Board      map[string]string `json:"board,omitempty"`
+
+	Content string `json:"content,omitempty"`
 }
 
 type client struct {
@@ -368,6 +374,41 @@ func handleClientMessage(c *client, sha string, msg Message) {
 		specs, _ := rdb.LRange(ctx, fmt.Sprintf("board:%d:queue", msg.BoardID), 0, -1).Result()
 		sendJSON(c, map[string]interface{}{"type": "spectators_update", "spectators": specs})
 
+		// --- PURE CACHE LOGIC: READ HISTORY ---
+		chatKey := fmt.Sprintf("board:%d:chat", msg.BoardID)
+
+		// 1. Ask Redis: "Do you have data?"
+		exists, _ := rdb.Exists(ctx, chatKey).Result()
+
+		var history []string
+
+		if exists > 0 {
+			// CACHE HIT: Fast read from RAM
+			log.Println("Cache HIT: Reading from Redis")
+			history, _ = rdb.LRange(ctx, chatKey, 0, -1).Result()
+		} else {
+			// CACHE MISS: Slow read from Disk (DB)
+			log.Println("Cache MISS: Reading from File & Repopulating Redis")
+
+			// 1. Read from DB
+			history = loadFromDisk(50)
+
+			// 2. Hydrate Cache (Populate Redis)
+			if len(history) > 0 {
+				// RPush accepts multiple values, but we loop here for simplicity
+				for _, jsonMsg := range history {
+					rdb.RPush(ctx, chatKey, jsonMsg)
+				}
+				// 3. Set TTL (Time To Live). Redis forgets this after 1 hour
+				rdb.Expire(ctx, chatKey, time.Hour)
+			}
+		}
+
+		sendJSON(c, map[string]interface{}{
+			"type":    "chat_history",
+			"history": history,
+		})
+
 	case "subscribe":
 		subscribeToBoard(c, msg.BoardID)
 
@@ -423,7 +464,33 @@ func handleClientMessage(c *client, sha string, msg Message) {
 				rotatePlayers(msg.BoardID)
 			}()
 		}
+
+	case "chat":
+		chatKey := fmt.Sprintf("board:%d:chat", msg.BoardID)
+
+		// 1. Prepare Data
+		chatPayload := map[string]string{
+			"type":    "chat",
+			"name":    msg.Name,
+			"content": msg.Content,
+		}
+		jsonBytes, _ := json.Marshal(chatPayload)
+		jsonStr := string(jsonBytes)
+
+		// 2. WRITE TO DB (Persistent File)
+		// If the server crashes or Redis dies, this data is safe.
+		writeToDisk(jsonStr)
+
+		// 3. WRITE TO CACHE (Redis)
+		// We update the cache so the NEXT read is fast.
+		rdb.RPush(ctx, chatKey, jsonStr)
+		rdb.LTrim(ctx, chatKey, -50, -1)    // Keep cache small
+		rdb.Expire(ctx, chatKey, time.Hour) // Refresh the TTL
+
+		// 4. Broadcast
+		rdb.Publish(ctx, fmt.Sprintf("board:%d", msg.BoardID), jsonBytes)
 	}
+
 }
 
 func sendJSON(c *client, v interface{}) {
@@ -441,4 +508,42 @@ func (c *client) safeSend(b []byte) {
 	case c.send <- b:
 	default:
 	}
+}
+
+func writeToDisk(msgJSON string) {
+	fileMu.Lock()
+	defer fileMu.Unlock()
+
+	f, err := os.OpenFile("chat_history.jsonl", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Println("DB Write Error:", err)
+		return
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(msgJSON + "\n"); err != nil {
+		log.Println("DB Write Error:", err)
+	}
+}
+func loadFromDisk(limit int) []string {
+	fileMu.Lock()
+	defer fileMu.Unlock()
+
+	f, err := os.Open("chat_history.jsonl")
+	if err != nil {
+		return []string{} // File doesn't exist yet
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	// Return only the last 'limit' lines
+	if len(lines) > limit {
+		return lines[len(lines)-limit:]
+	}
+	return lines
 }
