@@ -5,7 +5,7 @@ services:
   client:
     build: ./client
     ports:
-      - "666:80" # Exposed to the public
+      - "80:80" # Exposed to the public
     depends_on:
       - server
 
