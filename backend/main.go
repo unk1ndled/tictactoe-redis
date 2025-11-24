@@ -118,7 +118,7 @@ type Message struct {
 	Name       string            `json:"name,omitempty"`
 	Spectators []string          `json:"spectators,omitempty"`
 	Board      map[string]string `json:"board,omitempty"`
-	Content    string            `json:"content,omitempty"` // Chat Content
+	Content    string            `json:"content,omitempty"`
 }
 
 type client struct {
@@ -268,7 +268,7 @@ func main() {
 		<-c.done
 	})
 
-	log.Println("🚀 Server running on port 8080")
+	log.Println(" Server running on port 8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -276,6 +276,7 @@ func subscribeToBoard(c *client, boardID int) {
 	if c.pubsub != nil {
 		return
 	}
+	// sub
 	channel := fmt.Sprintf("board:%d", boardID)
 	pubsub := rdb.Subscribe(ctx, channel)
 	c.pubsub = pubsub
@@ -393,16 +394,16 @@ func handleClientMessage(c *client, sha string, msg Message) {
 		specs, _ := rdb.LRange(ctx, fmt.Sprintf("board:%d:queue", msg.BoardID), 0, -1).Result()
 		sendJSON(c, map[string]interface{}{"type": "spectators_update", "spectators": specs})
 
-		// --- PURE CACHE LOGIC: READ HISTORY ---
+		//
 		chatKey := fmt.Sprintf("board:%d:chat", msg.BoardID)
 
-		// 1. Check Cache
 		exists, _ := rdb.Exists(ctx, chatKey).Result()
 		var history []string
 
 		if exists > 0 {
 			// Cache HIT
 			history, _ = rdb.LRange(ctx, chatKey, 0, -1).Result()
+			log.Println("Cache Hit")
 		} else {
 			// Cache MISS: Load from File, Populate Redis
 			history = loadFromDisk(50)
@@ -410,8 +411,9 @@ func handleClientMessage(c *client, sha string, msg Message) {
 				for _, jsonMsg := range history {
 					rdb.RPush(ctx, chatKey, jsonMsg)
 				}
-				rdb.Expire(ctx, chatKey, time.Hour) // 1 Hour Cache TTL
+				rdb.Expire(ctx, chatKey, time.Hour)
 			}
+			log.Println("Cache miss, updating cache")
 		}
 
 		sendJSON(c, map[string]interface{}{
@@ -482,15 +484,15 @@ func handleClientMessage(c *client, sha string, msg Message) {
 		jsonBytes, _ := json.Marshal(chatPayload)
 		jsonStr := string(jsonBytes)
 
-		// 1. WRITE TO DISK (Persistence)
+		// WRITE TO DISK (Persistence)
 		writeToDisk(jsonStr)
 
-		// 2. WRITE TO CACHE (Redis)
+		// WRITE TO CACHE (Redis)
 		rdb.RPush(ctx, chatKey, jsonStr)
 		rdb.LTrim(ctx, chatKey, -50, -1)
 		rdb.Expire(ctx, chatKey, time.Hour)
 
-		// 3. BROADCAST
+		// BROADCAST
 		rdb.Publish(ctx, fmt.Sprintf("board:%d", msg.BoardID), jsonBytes)
 	}
 }
